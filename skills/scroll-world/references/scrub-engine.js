@@ -1,52 +1,49 @@
 /* ============================================================================
-   scroll-world — portable scroll-scrubbed camera-flight engine
+   scroll-world — portable scroll-scrubbed depth-parallax engine (WebGL)
    ----------------------------------------------------------------------------
-   Framework-agnostic. Vanilla JS, zero dependencies. It builds its own DOM and
-   injects its own (namespaced) CSS into a container you give it, so it drops into
-   plain HTML, Next.js (call from a ref/useEffect), Vue (onMounted), a server-
-   rendered page, anything.
+   Framework-agnostic. Vanilla JS + WebGL, zero dependencies. It builds its own
+   DOM and injects its own (namespaced) CSS into a container you give it, so it
+   drops into plain HTML, Next.js (call from a ref/useEffect), Vue (onMounted), a
+   server-rendered page, anything.
+
+   Instead of scrubbing pre-rendered video, the camera move is SYNTHESIZED at
+   runtime from a depth map: each section supplies a `still` image + a `depth`
+   grayscale map (white = near, black = far). A full-screen-quad fragment shader
+   displaces the still by its depth map as a function of scroll progress — a
+   push-in zoom plus depth parallax around the scene's `focal` — and crossfades to
+   the next scene across a fixed seam band. One continuous connected flight, no
+   cuts, no video files.
 
    USAGE
      mountScrollWorld(document.getElementById('world'), {
        brand: { name: 'Pearl & Co.', href: '#top' },
-       diveScroll: 1.3,   // viewport-heights of scroll per dive clip
-       connScroll: 0.9,   // ...per connector clip
+       scrollPer: 1.3,   // viewport-heights of scroll per scene
+       depth: 0.06,      // parallax strength (fraction of frame; keep <= ~0.08)
+       zoom: 0.18,       // how far the camera pushes in across a scene
+       crossfade: 0.14,  // seam dissolve width (viewport-heights)
        hint: 'scroll to fly in',
        nav: true,         // show the top section nav
-       atmosphere: true,  // subtle gradient + drifting particles behind the clips
+       atmosphere: true,  // subtle gradient + drifting particles behind the canvas
        sections: [
-         { id, label, still, stillMobile, clip, clipMobile, accent,
-           scroll: 1.6,   // optional per-section override of diveScroll — more scroll
+         { id, label, still, depth, accent,
+           focal:[0.5,0.42],  // where the camera dives toward (UV, y from top); optional
+           scroll: 1.6,   // optional per-section override of scrollPer — more scroll
                           // distance = a slower, longer dwell in this scene
-           linger: 0.5,   // optional 0..1 — remaps time so the camera settles mid-scene
-                          // (exactly where the copy peaks) and moves quicker at the
-                          // edges. 0 = linear (default). Keep ≤ 0.6; 1 = full pause.
+           linger: 0.5,   // optional 0..1 — remaps progress so the camera settles
+                          // mid-scene (exactly where the copy peaks) and moves quicker at
+                          // the edges. 0 = linear (default). Keep <= 0.6; 1 = full pause.
            eyebrow, title, body, tags:[…],
            cta:{ primary:{label,href}, secondary:{label,href} } }, // last section only
-         …
-       ],
-       connectors: [clipUrl, …],          // length = sections.length - 1 (nulls allowed)
-       connectorsMobile: [clipUrl, …],    // optional lighter connectors for phones (same length)
+         … ]
+     });
 
-   MOBILE (the clipMobile/connectorsMobile variants are the opt-in mobile version;
-   the rest of the phone handling below is always on)
-     The engine is phone-aware out of the box: on a coarse-pointer / ≤860px viewport it
-       - loads `clipMobile` / `connectorsMobile` when provided (encode these smaller +
-         tighter-GOP — seek cost on a phone decoder is dominated by frames-from-keyframe,
-         so a 720p, -g 4 file scrubs far smoother than the 1080p desktop master; see
-         pipeline.md). Falls back to the desktop `clip` if no mobile variant is given.
-       - uses `stillMobile` as the scene poster when provided (pair it with native 9:16
-         clipMobile renders so the poster matches the portrait video's first frame instead
-         of flashing from a landscape crop). Chosen once at mount; a desktop resize into
-         phone width keeps the desktop poster (clips still switch via isMobile()).
-       - coalesces seeks (never issues a new currentTime while the decoder is still
-         `seeking`) so fast flicks can't pile up and freeze the video.
-       - keeps the still as a live poster until the clip actually paints its first frame,
-         and primes each video (muted play→pause) on first touch — this is what stops iOS
-         from showing a blank scene before the first seek.
-       - drops the drifting particles and ignores URL-bar-only resizes (no scroll jump).
-     Nothing here is required — a config with only `clip`/`connectors` still works on
-     phones; the mobile variants just make it lighter and smoother.
+   MOBILE (always on, no separate assets)
+     The engine is phone-aware out of the box: on a coarse-pointer / <=860px viewport it
+       - dials `depth` down (~40%) so a small screen doesn't smear the parallax,
+       - drops the drifting particles,
+       - ignores URL-bar-only resizes (no scroll jump),
+     and otherwise serves the exact same still+depth pair as desktop — there is no second
+     render or encode to wire.
 
    THEME (CSS custom properties; set on the container or :root to override)
      --sw-bg         page background (match your scene bg for seamless posters)
@@ -56,52 +53,46 @@
      --sw-font-display / --sw-font-body
 
    REQUIREMENTS ON YOUR ASSETS
-     - clips encoded native-res, crf~20, -g 8, +faststart, no audio (see pipeline.md)
-     - connectors' endpoints are the neighbouring dives' ACTUAL frames (see SKILL Step 5)
-     - (optional) mobile variants at ~720p, -g 4 for smoother phone scrubbing
-   The engine loads each clip as a Blob (always seekable) and scrubs currentTime; it does
-   NOT depend on HTTP byte-range support.
+     - `still`  : a still image (webp/png), any generator. 3:2 reads best.
+     - `depth`  : a grayscale map, white = near / black = far, SAME convention for
+                  every scene (see depth-map.py). This is what makes the seams hold.
+     The engine loads each pair as a WebGL texture (lazy, near the active scroll) and
+     displaces it in the shader; it does NOT depend on HTTP byte-range support.
    ========================================================================== */
 
 function mountScrollWorld(container, config) {
   const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   // Phone detection. `coarse` is captured once (input type doesn't change mid-session);
-  // the ≤860px query is read live via isMobile() so a desktop resize/DevTools toggle
-  // switches sources and seek behaviour without a reload.
+  // the <=860px query is read live via isMobile() so a desktop resize/DevTools toggle
+  // switches behaviour without a reload.
   const coarse = window.matchMedia('(hover: none) and (pointer: coarse)').matches;
   const smallMQ = window.matchMedia('(max-width: 860px)');
   const isMobile = () => coarse || smallMQ.matches;
   const SECTIONS = config.sections || [];
-  const CONNECTORS = config.connectors || [];
-  const CONNECTORS_M = config.connectorsMobile || [];
-  const DIVE_W = config.diveScroll || 1.3;
-  const CONN_W = config.connScroll || 0.9;
-  const CROSSFADE = (config.crossfade != null) ? config.crossfade : 0.12;  // seam dissolve width (vh)
   const N = SECTIONS.length;
   if (!N) return;
+
+  const SCROLL_PER = config.scrollPer || 1.3;
+  const ZOOM = config.zoom != null ? config.zoom : 0.18;          // push-in amount
+  const CROSSFADE = config.crossfade != null ? config.crossfade : 0.14; // seam band (vh)
+  let DEPTH_AMT = config.depth != null ? config.depth : 0.06;     // parallax strength
+  if (isMobile()) DEPTH_AMT *= 0.4;                                // lighter on phones
 
   injectCSS();
   container.classList.add('sw-root');
 
-  // ---- build the interleaved segment chain: dive0, conn0, dive1, … diveN-1 ----
-  const SEGMENTS = [];
-  SECTIONS.forEach((s, i) => {
-    const dive = { kind: 'dive', si: i, clip: s.clip, clipM: s.clipMobile, still: s.still, stillM: s.stillMobile,
-                   accent: s.accent, w: s.scroll || DIVE_W, linger: s.linger || 0 };
-    SEGMENTS.push(dive);
-    s._seg = dive;
-    // A connector is optional: if connectors[i] is falsy, the two dives simply
-    // crossfade directly (no fly-over). Lets a page complete even when a
-    // connector can't be generated (e.g. a content-filter false-positive).
-    if (i < N - 1 && CONNECTORS[i]) {
-      SEGMENTS.push({ kind: 'conn', si: i, clip: CONNECTORS[i], clipM: CONNECTORS_M[i],
-                      still: SECTIONS[i + 1].still, stillM: SECTIONS[i + 1].stillMobile,
-                      accent: SECTIONS[i + 1].accent, w: CONN_W });
-    }
-  });
-  const NSEG = SEGMENTS.length;
+  // ---- build the segment chain: one segment per section (no connectors) ----
+  const SEGMENTS = SECTIONS.map((s, i) => ({
+    si: i, still: s.still, depth: s.depth, accent: s.accent,
+    focal: s.focal || [0.5, 0.42],
+    w: s.scroll || SCROLL_PER, linger: s.linger || 0,
+    tex: null, depthTex: null, iw: 0, ih: 0,
+    loaded: false, loading: false,
+    cur: 0, target: 0, visible: false,
+    el: null, img: null,
+  }));
 
-  // ---- DOM ----
+  // ---- DOM (chrome) ----
   const sky = el('div', 'sw-sky');
   if (config.atmosphere !== false) {
     sky.appendChild(el('div', 'sw-sky__grad'));
@@ -126,6 +117,20 @@ function mountScrollWorld(container, config) {
   }
 
   const stage = el('div', 'sw-stage');
+  // Posters: the still shown behind the canvas until its WebGL texture is ready (and the
+  // only visual under prefers-reduced-motion). One per segment, faded by scroll distance.
+  SEGMENTS.forEach(s => {
+    const scene = el('div', 'sw-scene'); scene.style.setProperty('--sw-accent', s.accent || '');
+    const img = el('img', 'sw-scene__still'); img.alt = ''; img.decoding = 'async'; img.loading = 'lazy';
+    if (s.still) img.src = s.still;
+    scene.appendChild(img); stage.appendChild(scene);
+    s.el = scene; s.img = img;
+  });
+  // The WebGL canvas sits above the posters.
+  const canvas = document.createElement('canvas');
+  canvas.className = 'sw-stage__gl';
+  stage.appendChild(canvas);
+
   const copylayer = el('div', 'sw-copylayer');
   const route = el('div', 'sw-route');
   const hint = el('div', 'sw-hint');
@@ -134,17 +139,6 @@ function mountScrollWorld(container, config) {
   const track = el('div', 'sw-track');
 
   [sky, scrollbar, topbar, stage, copylayer, route, hint, track].forEach(n => container.appendChild(n));
-
-  // segment scenes
-  SEGMENTS.forEach(s => {
-    const scene = el('div', 'sw-scene'); scene.style.setProperty('--sw-accent', s.accent || '');
-    const img = el('img', 'sw-scene__still'); img.alt = ''; img.decoding = 'async'; img.loading = 'lazy';
-    const poster = (isMobile() && s.stillM) ? s.stillM : s.still;
-    if (poster) img.src = poster;
-    scene.appendChild(img); stage.appendChild(scene);
-    s.el = scene; s.img = img; s.video = null; s.hasClip = false;
-    s.loading = false; s.ready = false; s.cur = 0; s.target = 0; s.visible = false;
-  });
 
   // per-section copy / route / nav
   const copies = [], dots = [];
@@ -172,77 +166,174 @@ function mountScrollWorld(container, config) {
   // ---- math ----
   const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
   const smooth = x => { x = clamp(x); return x * x * (3 - 2 * x); };
-  // Per-section dwell: monotone remap of scroll→time so the camera settles mid-scene
+  // Per-section dwell: monotone remap of scroll→progress so the camera settles mid-scene
   // (where the copy peaks) and moves quicker near the seams. L=0 linear, L=1 full
-  // mid-scene pause. f(0)=0, f(1)=1 always, so seam frames are untouched.
+  // mid-scene pause. f(0)=0, f(1)=1 always, so seam progress is untouched.
   const lingerEase = (x, L) => { L = clamp(L); const c = x - 0.5; return (1 - L) * x + L * (4 * c * c * c + 0.5); };
-  let vh = window.innerHeight, stageX = 0, totalW = 0, activeIndex = -1, ticking = false;
-  let laidOutW = window.innerWidth;   // width the current layout was computed at (see onResize)
+  let vh = window.innerHeight, totalH = 0, activeIndex = -1, ticking = false;
+  let laidOutW = window.innerWidth;   // width the current layout was computed at
 
   function layout() {
     vh = window.innerHeight;
     laidOutW = window.innerWidth;
-    stageX = window.innerWidth > 860 ? 4 : 0;
     let off = 0;
     SEGMENTS.forEach(s => { s.start = off * vh; off += s.w; s.end = off * vh; });
-    totalW = off;
-    track.style.height = (totalW * vh + vh) + 'px';   // +1vh so the last flight completes
+    totalH = off;
+    track.style.height = (totalH * vh + vh) + 'px';   // +1vh so the last flight completes
     read();
   }
 
   function jumpTo(i) {
-    const seg = SECTIONS[i]._seg;
+    const seg = SEGMENTS[i];
     window.scrollTo({ top: seg.start + (seg.end - seg.start) * 0.5, behavior: reduce ? 'auto' : 'smooth' });
   }
 
-  function loadClip(s) {
-    // Under prefers-reduced-motion we never load the clips at all — the stills stay up
-    // and simply cross-dissolve as you scroll. No scrubbed video motion, no decode cost.
-    if (reduce || s.loading || !s.clip) return;
-    s.loading = true;
-    // Serve the lighter mobile encode on phones when one was provided.
-    const url = (isMobile() && s.clipM) ? s.clipM : s.clip;
-    fetch(url).then(r => r.ok ? r.blob() : Promise.reject(new Error('404')))
-      .then(blob => {
-        const v = document.createElement('video');
-        v.className = 'sw-scene__video';
-        v.muted = true; v.playsInline = true; v.preload = 'auto';
-        v.setAttribute('muted', ''); v.setAttribute('playsinline', '');
-        v.src = URL.createObjectURL(blob);
-        v.addEventListener('loadedmetadata', () => { s.ready = true; read(); });
-        // Reveal the video (hide the still poster) only once a real frame has
-        // painted — on iOS a seeked-but-never-played muted video stays blank, so
-        // hiding the still on metadata alone would flash an empty scene.
-        v.addEventListener('seeked', () => { s.el.classList.add('has-clip'); }, { once: true });
-        v.addEventListener('loadeddata', () => { try { v.pause(); } catch (e) {} if (userReady) primeVideo(v); });
-        s.el.appendChild(v); s.video = v; s.hasClip = true;
-      }).catch(() => { s.loading = false; });
+  // ---- WebGL (skipped entirely under prefers-reduced-motion) ----
+  let gl = null, prog = null, U = {}, quad = null;
+  if (!reduce) {
+    gl = canvas.getContext('webgl', { antialias: true, alpha: true, premultipliedAlpha: false })
+      || canvas.getContext('experimental-webgl', { antialias: true, alpha: true });
+    if (gl) { prog = buildProgram(gl); if (prog) cacheUniforms(); }
+    if (!gl || !prog) {
+      // Graceful fallback: behave as if reduced-motion (posters only, no shader).
+      gl = null;
+      console.warn('scroll-world: WebGL unavailable — falling back to static stills.');
+    }
   }
 
+  function cacheUniforms() {
+    U.uStill = gl.getUniformLocation(prog, 'uStill');
+    U.uDepth = gl.getUniformLocation(prog, 'uDepth');
+    U.uCover = gl.getUniformLocation(prog, 'uCover');
+    U.uFocal = gl.getUniformLocation(prog, 'uFocal');
+    U.uProgress = gl.getUniformLocation(prog, 'uProgress');
+    U.uDepthAmt = gl.getUniformLocation(prog, 'uDepthAmt');
+    U.uZoom = gl.getUniformLocation(prog, 'uZoom');
+    U.uAlpha = gl.getUniformLocation(prog, 'uAlpha');
+  }
+
+  function resizeCanvas() {
+    if (!gl) return;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    // The canvas is 100% of the fixed viewport-height stage, so size the drawing
+    // buffer from its own CSS box (fall back to the window if not yet laid out).
+    const w = canvas.clientWidth || window.innerWidth;
+    const h = canvas.clientHeight || window.innerHeight;
+    const W = Math.max(1, Math.floor(w * dpr));
+    const H = Math.max(1, Math.floor(h * dpr));
+    if (canvas.width !== W || canvas.height !== H) { canvas.width = W; canvas.height = H; }
+  }
+
+  function makeTexture(url) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => {
+        if (!gl) { reject(new Error('no gl')); return; }
+        const tex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        tex._w = img.naturalWidth; tex._h = img.naturalHeight;
+        resolve(tex);
+      };
+      img.onerror = () => reject(new Error('load ' + url));
+      img.src = url;
+    });
+  }
+
+  function loadScene(s) {
+    if (s.loading || s.loaded || !s.still || !s.depth || !gl) return;
+    s.loading = true;
+    Promise.all([makeTexture(s.still), makeTexture(s.depth)])
+      .then(([t, d]) => { s.tex = t; s.depthTex = d; s.iw = t._w; s.ih = t._h; s.loaded = true; s.el.classList.add('has-tex'); read(); })
+      .catch(() => { s.loading = false; });
+  }
+
+  // cover: UV sub-rect scale so the still fills the canvas (object-fit: cover).
+  function coverScale(iw, ih, cw, ch) {
+    const ir = iw / ih, cr = cw / ch;
+    if (cr > ir) return [1.0, ir / cr];
+    return [cr / ir, 1.0];
+  }
+
+  function drawScene(s, p, alpha) {
+    if (!s.loaded || !gl) return;
+    gl.useProgram(prog);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, s.tex); gl.uniform1i(U.uStill, 0);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, s.depthTex); gl.uniform1i(U.uDepth, 1);
+    const cs = coverScale(s.iw, s.ih, canvas.width, canvas.height);
+    gl.uniform2f(U.uCover, cs[0], cs[1]);
+    gl.uniform2f(U.uFocal, s.focal[0], 1 - s.focal[1]);   // shader UV is y-up
+    gl.uniform1f(U.uProgress, p);
+    gl.uniform1f(U.uDepthAmt, DEPTH_AMT);
+    gl.uniform1f(U.uZoom, 1 + ZOOM);
+    gl.uniform1f(U.uAlpha, alpha);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+  }
+
+  function render() {
+    if (!gl) return;
+    resizeCanvas();
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+    const y = window.scrollY || window.pageYOffset || 0;
+    let ci = 0;
+    for (let i = 0; i < N; i++) if (y >= SEGMENTS[i].start) ci = i;
+    const seg = SEGMENTS[ci];
+    let p = clamp((y - seg.start) / (seg.end - seg.start), 0, 1);
+    if (seg.linger) p = lingerEase(p, seg.linger);
+    // lerp the rendered progress toward the scroll target for buttery motion
+    seg.cur += (p - seg.cur) * 0.2;
+
+    drawScene(seg, seg.cur, 1.0);
+
+    // Crossfade to the next scene across the seam band: next is held at its WIDE pose
+    // (progress 0) and faded in. Its pose is identical on both sides of the seam, so the
+    // hand-off is continuous — the only thing changing is which scene is on top.
+    const band = CROSSFADE * vh;
+    if (ci < N - 1 && (seg.end - y) < band) {
+      const a = clamp((seg.end - y) / band, 0, 1);   // 1 at band start -> 0 at seam
+      drawScene(SEGMENTS[ci + 1], 0.0, 1 - a);
+    }
+  }
+
+  // ---- read(): scroll -> segment progress + chrome (copy, route, posters) ----
   function read() {
-    const y = window.scrollY || window.pageYOffset;
+    const y = window.scrollY || window.pageYOffset || 0;
     const fade = CROSSFADE * vh;
     let ci = 0;
-    for (let i = 0; i < NSEG; i++) if (y >= SEGMENTS[i].start) ci = i;
+    for (let i = 0; i < N; i++) if (y >= SEGMENTS[i].start) ci = i;
 
-    for (let i = 0; i < NSEG; i++) {
+    for (let i = 0; i < N; i++) {
       const s = SEGMENTS[i];
-      if (y > s.start - 1.6 * vh && y < s.end + 1.6 * vh) loadClip(s);
+      // lazy-load textures for segments near the viewport
+      if (!reduce && gl) { if (y > s.start - 1.6 * vh && y < s.end + 1.6 * vh) loadScene(s); }
       const local = clamp((y - s.start) / (s.end - s.start), 0, 1);
       s.target = s.linger ? lingerEase(local, s.linger) : local;
       let outside = 0;
       if (y < s.start) outside = s.start - y; else if (y > s.end) outside = y - s.end;
       const op = smooth(1 - outside / fade);
-      s.el.style.opacity = op; s.visible = op > 0.001;
+      // When there's no shader (reduced-motion OR WebGL unavailable) the posters ARE the
+      // visual, so fade them by scroll distance. Otherwise the canvas covers a loaded
+      // poster, and an unloaded poster shows at `op` until its texture arrives.
+      const noShader = reduce || !gl;
+      s.img.style.opacity = noShader ? op : (s.loaded ? 0 : op);
+      s.el.style.opacity = noShader ? op : 1;
       s.el.style.zIndex = (i === ci) ? '120' : String(100 + Math.round(op * 10));
-      if (!s.hasClip || !s.ready) {
-        const sc = reduce ? 1 : 1.03 + local * 0.14;
-        s.img.style.transform = `translateX(${stageX - 2}vw) scale(${sc.toFixed(3)})`;
-      }
+      s.visible = op > 0.001;
     }
 
     for (let i = 0; i < N; i++) {
-      const seg = SECTIONS[i]._seg;
+      const seg = SEGMENTS[i];
       const pr = clamp((y - seg.start) / (seg.end - seg.start), 0, 1);
       const before = y < seg.start, after = y > seg.end;
       let cop;
@@ -256,64 +347,44 @@ function mountScrollWorld(container, config) {
     }
 
     const cur = SEGMENTS[ci];
-    const near = clamp(cur.kind === 'dive' ? cur.si
-      : (((y - cur.start) / (cur.end - cur.start)) > 0.5 ? cur.si + 1 : cur.si), 0, N - 1);
+    const near = clamp(ci, 0, N - 1);
     if (near !== activeIndex) {
       activeIndex = near;
       dots.forEach((d, k) => d.classList.toggle('is-active', k === near));
       nav.querySelectorAll('.sw-nav__item').forEach((n, k) => n.classList.toggle('is-active', k === near));
       container.style.setProperty('--sw-accent', SECTIONS[near].accent || '');
     }
-    scrollbarFill.style.transform = `scaleX(${clamp(y / (totalW * vh))})`;
+    scrollbarFill.style.transform = `scaleX(${clamp(y / (totalH * vh))})`;
     hint.style.opacity = clamp(1 - y / (0.5 * vh));
     if (particles) particles.style.transform = `translate3d(0, ${-y * 0.05}px, 0)`;
+
+    if (!reduce && gl) render();
     ticking = false;
   }
 
+  // continuous rAF only while the user is scrolling/settling, to keep it cheap
   function raf() {
-    const eps = isMobile() ? 0.02 : 0.008;   // coarser seek step on phones = fewer decodes
-    for (let i = 0; i < NSEG; i++) {
+    const y = window.scrollY || window.pageYOffset || 0;
+    // keep lerping until the rendered progress catches up to the target
+    let moving = false;
+    for (let i = 0; i < N; i++) {
       const s = SEGMENTS[i];
-      if (!s.hasClip || !s.ready || !s.video) continue;
-      // Never queue a seek while the decoder is still resolving the last one.
-      // On phones a fast flick would otherwise pile up seeks and freeze the clip;
-      // cur keeps lerping, so we snap to the latest target the moment it's free.
-      if (s.video.seeking) continue;
-      if (!s.visible && Math.abs(s.cur - s.target) < 0.002) continue;
-      s.cur += (s.target - s.cur) * (reduce ? 1 : 0.18);
-      const dur = s.video.duration || 1;
-      const t = clamp(s.cur, 0, 0.999) * dur;
-      if (Math.abs(s.video.currentTime - t) > eps) { try { s.video.currentTime = t; } catch (e) {} }
+      if (Math.abs(s.cur - s.target) > 0.001) { s.cur += (s.target - s.cur) * 0.2; moving = true; }
     }
-    requestAnimationFrame(raf);
+    if (!reduce && gl) render();
+    if (moving) requestAnimationFrame(raf);
+    else ticking = false;
   }
 
-  // iOS needs a user gesture before a muted video will decode/paint reliably. On the
-  // first touch we prime every loaded clip (muted play→pause) so the first seek is
-  // instant instead of showing a blank frame. `userReady` also makes freshly-loaded
-  // clips prime themselves (see loadClip).
-  let userReady = false;
-  function primeVideo(v) {
-    if (!isMobile() || !v) return;
-    try { const p = v.play(); if (p && p.then) p.then(() => { try { v.pause(); } catch (e) {} }).catch(() => {}); }
-    catch (e) {}
-  }
-  function onFirstGesture() {
-    if (userReady) return;
-    userReady = true;
-    SEGMENTS.forEach(s => primeVideo(s.video));
-  }
-  window.addEventListener('pointerdown', onFirstGesture, { once: true, passive: true });
-  window.addEventListener('touchstart', onFirstGesture, { once: true, passive: true });
+  window.addEventListener('scroll', () => {
+    if (!ticking) { ticking = true; requestAnimationFrame(read); }
+    if (!reduce && gl) requestAnimationFrame(raf);
+  }, { passive: true });
 
-  // Particles are a per-frame cost we can't afford alongside video scrubbing on a phone.
-  seedParticles(particles, reduce || coarse);
-  window.addEventListener('scroll', () => { if (!ticking) { ticking = true; requestAnimationFrame(read); } }, { passive: true });
   // Mobile browsers fire `resize` every time the URL bar slides in/out. Re-running
   // layout() there rebuilds the track height and yanks the scroll position, so on
   // touch we ignore height-only changes and only relayout when the width actually
-  // changes (rotation still comes through orientationchange). layout() records the
-  // width it laid out at.
+  // changes (rotation still comes through orientationchange).
   function onResize() {
     if (coarse && window.innerWidth === laidOutW) return;
     layout();
@@ -322,12 +393,75 @@ function mountScrollWorld(container, config) {
   window.addEventListener('orientationchange', layout);
   window.addEventListener('load', layout);
   layout();
-  requestAnimationFrame(raf);
+  if (!reduce && gl) requestAnimationFrame(raf);
 
-  // ---- helpers ----
+  // ---- WebGL helpers ----
+  function buildProgram(gl) {
+    const vs = `
+      attribute vec2 aPos;
+      varying vec2 vUv;
+      void main() {
+        vUv = aPos * 0.5 + 0.5;
+        gl_Position = vec4(aPos, 0.0, 1.0);
+      }`;
+    const fs = `
+      precision highp float;
+      uniform sampler2D uStill;
+      uniform sampler2D uDepth;
+      uniform vec2 uCover;
+      uniform vec2 uFocal;
+      uniform float uProgress;
+      uniform float uDepthAmt;
+      uniform float uZoom;
+      uniform float uAlpha;
+      varying vec2 vUv;
+      void main() {
+        // 1) cover-fit the still into the canvas (object-fit: cover)
+        vec2 uv = (vUv - 0.5) * uCover + 0.5;
+        // 2) push-in zoom around the focal point (progress 0 -> wide, 1 -> deep)
+        float s = mix(1.0, uZoom, uProgress);
+        uv = (uv - uFocal) / s + uFocal;
+        // 3) depth parallax: sample depth in image space, displace near(white) more
+        float d = texture2D(uDepth, uv).r;          // 0 far .. 1 near (white = near)
+        uv -= (uv - uFocal) * (d - 0.5) * uDepthAmt * uProgress;
+        vec4 c = texture2D(uStill, uv);
+        gl_FragColor = vec4(c.rgb, c.a * uAlpha);
+      }`;
+    const v = compile(gl, gl.VERTEX_SHADER, vs);
+    const f = compile(gl, gl.FRAGMENT_SHADER, fs);
+    if (!v || !f) return null;
+    const p = gl.createProgram();
+    gl.attachShader(p, v); gl.attachShader(p, f); gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+      console.error('scroll-world: link failed', gl.getProgramInfoLog(p));
+      return null;
+    }
+    // full-screen quad (two triangles)
+    quad = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+      -1, -1, 1, -1, -1, 1,
+      -1, 1, 1, -1, 1, 1,
+    ]), gl.STATIC_DRAW);
+    const loc = gl.getAttribLocation(p, 'aPos');
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+    return p;
+  }
+  function compile(gl, type, src) {
+    const sh = gl.createShader(type);
+    gl.shaderSource(sh, src); gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+      console.error('scroll-world: shader compile failed', gl.getShaderInfoLog(sh));
+      return null;
+    }
+    return sh;
+  }
+
+  // ---- generic helpers ----
   function el(tag, cls) { const n = document.createElement(tag); if (cls) n.className = cls; return n; }
   function pad(n) { return String(n).padStart(2, '0'); }
-  function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+  function esc(s) { return String(s).replace(/[&<>"\/]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', '/': '&#47;' }[c])); }
   function ctaBtns(cta) {
     let h = '';
     if (cta.primary) h += `<a class="sw-btn sw-btn--primary" href="${esc(cta.primary.href || '#')}">${esc(cta.primary.label)}</a>`;
@@ -380,13 +514,10 @@ function injectCSS() {
   .sw-nav__item{font:inherit;font-size:.82rem;color:var(--sw-ink-soft);border:0;background:transparent;cursor:pointer;padding:7px 14px;border-radius:999px;transition:color .25s,background .25s;}
   .sw-nav__item:hover{color:var(--sw-ink);} .sw-nav__item.is-active{color:#fff;background:var(--sw-accent);}
   .sw-topcta{text-decoration:none;font-weight:600;font-size:.9rem;color:#fff;background:var(--sw-ink);padding:10px 20px;border-radius:999px;white-space:nowrap;}
-  .sw-stage{position:fixed;inset:0;z-index:10;pointer-events:none;}
+  .sw-stage{position:fixed;inset:0;z-index:10;pointer-events:none;background:var(--sw-bg);}
+  .sw-stage__gl{position:absolute;inset:0;width:100%;height:100%;display:block;z-index:2;}
   .sw-scene{position:absolute;inset:0;opacity:0;overflow:hidden;will-change:opacity;}
-  .sw-scene__video,.sw-scene__still{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;object-position:center 42%;}
-  .sw-scene__still{will-change:transform;} .sw-scene.has-clip .sw-scene__still{opacity:0;} .sw-scene__video{z-index:1;}
-  .sw-copylayer{position:fixed;inset:0;z-index:20;pointer-events:none;}
-  .sw-copylayer::before{content:"";position:absolute;inset:0;width:min(58vw,780px);background:linear-gradient(90deg,var(--sw-bg) 0%,color-mix(in srgb,var(--sw-bg) 82%,transparent) 34%,color-mix(in srgb,var(--sw-bg) 40%,transparent) 62%,transparent 100%);}
-  .sw-copy{position:absolute;left:clamp(18px,5vw,64px);top:50%;transform:translateY(-50%);width:min(42vw,460px);opacity:0;will-change:opacity,transform;}
+  .sw-scene__still{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;object-position:center 42%;z-index:1;}
   .sw-copy__num{font-family:ui-monospace,Menlo,monospace;font-size:.74rem;letter-spacing:.12em;color:var(--sw-ink-soft);}
   .sw-copy__eyebrow{display:block;margin-top:18px;font-family:var(--sw-font-display);font-weight:700;font-size:.8rem;letter-spacing:.16em;text-transform:uppercase;color:var(--sw-accent);}
   .sw-copy__title{font-family:var(--sw-font-display);font-weight:700;color:var(--sw-ink);font-size:clamp(2rem,4.4vw,3.5rem);line-height:1.03;margin:12px 0 0;letter-spacing:-.01em;text-shadow:0 2px 20px color-mix(in srgb,var(--sw-bg) 70%,transparent);}
@@ -397,6 +528,9 @@ function injectCSS() {
   .sw-btn{text-decoration:none;font-weight:600;font-size:.95rem;padding:13px 24px;border-radius:999px;transition:transform .2s;}
   .sw-btn--primary{color:#fff;background:var(--sw-ink);} .sw-btn--primary:hover{transform:translateY(-2px);}
   .sw-btn--ghost{color:var(--sw-ink);border:1.5px solid color-mix(in srgb,var(--sw-ink) 25%,transparent);} .sw-btn--ghost:hover{transform:translateY(-2px);}
+  .sw-copylayer{position:fixed;inset:0;z-index:20;pointer-events:none;}
+  .sw-copylayer::before{content:"";position:absolute;inset:0;width:min(58vw,780px);background:linear-gradient(90deg,var(--sw-bg) 0%,color-mix(in srgb,var(--sw-bg) 82%,transparent) 34%,color-mix(in srgb,var(--sw-bg) 40%,transparent) 62%,transparent 100%);}
+  .sw-copy{position:absolute;left:clamp(18px,5vw,64px);top:50%;transform:translateY(-50%);width:min(42vw,460px);opacity:0;will-change:opacity,transform;}
   .sw-route{position:fixed;right:clamp(14px,2.4vw,30px);top:50%;z-index:40;transform:translateY(-50%);display:flex;flex-direction:column;gap:22px;padding:18px 10px;}
   .sw-route::before{content:"";position:absolute;left:50%;top:22px;bottom:22px;width:2px;transform:translateX(-50%);background:var(--sw-accent);opacity:.28;}
   .sw-route__dot{position:relative;border:0;background:transparent;cursor:pointer;width:14px;height:14px;display:grid;place-items:center;}
@@ -413,27 +547,22 @@ function injectCSS() {
   @media (max-width:860px){
     .sw-nav{display:none;}
     .sw-copylayer::before{width:100%;height:60%;top:auto;bottom:0;background:linear-gradient(0deg,var(--sw-bg) 8%,color-mix(in srgb,var(--sw-bg) 70%,transparent) 46%,transparent 100%);}
-    /* Anchor copy to the bottom, clear of the home indicator / collapsing URL bar.
-       dvh + env() are progressive: browsers that lack them keep the vh fallback line. */
     .sw-copy{left:clamp(18px,5vw,64px);right:clamp(18px,5vw,64px);top:auto;bottom:clamp(64px,14vh,120px);transform:none;width:auto;max-width:560px;}
     .sw-copy{bottom:calc(clamp(56px,12dvh,110px) + env(safe-area-inset-bottom));}
     .sw-copy__title{font-size:clamp(1.9rem,7.5vw,2.7rem);}
-    .sw-copy__body{max-width:none;font-size:clamp(.98rem,3.6vw,1.1rem);} .sw-scene__video,.sw-scene__still{object-position:center 46%;}
+    .sw-copy__body{max-width:none;font-size:clamp(.98rem,3.6vw,1.1rem);} .sw-scene__still{object-position:center 46%;}
     .sw-hint{bottom:calc(20px + env(safe-area-inset-bottom));}
     .sw-route{gap:16px;right:6px;} .sw-route__label{display:none;}
   }
-  /* Portrait phones crop a 16:9 clip hard; keep the framing centred so the focal
-     subject (which the camera dives toward) stays in view. */
   @media (max-width:860px) and (orientation:portrait){
-    .sw-scene__video,.sw-scene__still{object-position:center 44%;}
+    .sw-scene__still{object-position:center 44%;}
   }
-  /* Touch: give the route dots a finger-sized hit area without growing the visible dot. */
   @media (hover:none) and (pointer:coarse){
     .sw-route{padding:14px 6px;}
     .sw-route__dot{width:28px;height:28px;}
     .sw-btn{padding:15px 26px;}
   }
-  @media (prefers-reduced-motion:reduce){ .sw-hint i::after{animation:none;} .sw-pt{display:none;} }
+  @media (prefers-reduced-motion:reduce){ .sw-hint i::after{animation:none;} .sw-pt{display:none;} .sw-stage__gl{display:none;} }
   `;
   // Wrap in a cascade layer so the page's own theme tokens (unlayered
   // :root / .sw-root { --sw-bg / --sw-ink / --sw-accent … }) always win over

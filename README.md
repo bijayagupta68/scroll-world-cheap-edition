@@ -46,25 +46,29 @@ cp -R scroll-world/skills/scroll-world ~/.codex/skills/    # Codex
 
 ## Requirements
 
-- The [Higgsfield CLI](https://higgsfield.ai), authenticated (`higgsfield auth login`),
-  with credits.
-- `ffmpeg` / `ffprobe` for frame extraction and encoding.
-- Python 3 with Pillow (for the mobile portrait canvases; also the optional
-  transparent-scene knockout).
-- The [Codex CLI](https://github.com/openai/codex) (optional) — if present, the scene
-  stills can be generated through Codex's built-in `image_gen` (the same GPT Image
-  model), billed to a ChatGPT subscription instead of Higgsfield credits.
+- **A depth-estimation model** — [Depth-Anything](https://github.com/LiheYoung/Depth-Anything)
+  via `pip install torch transformers` (or the standalone package), fetching a checkpoint
+  such as `depth-anything-large-hf`. This is what turns each still into a depth map; the
+  camera move is synthesized from those maps in the browser, so there are **no videos and
+  no credits**.
+- **Python 3 with Pillow** — for the optional transparent-scene knockout (`knockout.py`).
+- An **image generator for the stills** (no Higgsfield CLI required). The skill prefers the
+  [Codex CLI](https://github.com/openai/codex) `image_gen` (billed to a ChatGPT
+  subscription, zero credits) when present; otherwise you just drop your own stills into a
+  folder. `ffmpeg` is not needed.
 
 ## What it does
 
-It leans on [Higgsfield](https://higgsfield.ai) for the art: cohesive isometric diorama
-scenes (GPT Image 2 — via Higgsfield, or the Codex CLI on a ChatGPT subscription) and the
-camera flights themselves (Seedance or Kling image-to-video — only models that can
-frame-lock a seam), scrubbed
-by scroll position — the same technique behind Apple's scroll-through product pages. The
-camera genuinely moves; scroll only drives time. It's **framework-agnostic**: you get the
-Higgsfield pipeline, the prompt templates, and a portable vanilla-JS scrub engine that
-drops into plain HTML, Next.js, Vue, or a Python-served page — nothing assumes a stack.
+It leans on AI for the art: cohesive isometric diorama **stills** (generated via the
+[Codex CLI](https://github.com/openai/codex) `image_gen` on a ChatGPT subscription, or any
+image tool you like), and a **depth map per still** (Depth-Anything). The camera flight
+itself is synthesized live in the browser: a WebGL shader displaces each still by its depth
+map as you scroll, pushing the camera from outside the scene into its interior, then
+crossfading to the next — the same technique family behind Apple's scroll-through product
+pages. The camera genuinely moves; scroll only drives time. It's **framework-agnostic**: you
+get the stills + depth pipeline, the prompt templates, and a portable vanilla-JS/WebGL scrub
+engine that drops into plain HTML, Next.js, Vue, or a Python-served page — nothing assumes a
+stack.
 
 When invoked, the skill:
 
@@ -74,11 +78,10 @@ When invoked, the skill:
    portrait — composed for phones, not a crop of the landscape film), and the **budget** —
    render tiers and stills source shown with estimated credit costs, approved before
    anything generates.
-2. **Generates the assets** — one still per scene, one "dive-in" camera
-   clip per scene, and the **connector** clips that join consecutive scenes, generated
-   from the actual rendered frames of their neighbours so every seam is frame-identical.
-   Mobile opt-in renders a parallel portrait chain the same way, frame-locked against its
-   own 9:16 renders.
+2. **Generates the assets** — one still per scene, then a **depth map per still**
+   (Depth-Anything). The depth maps are what let the shader fake the camera dive and
+   blend one scene into the next, so every seam crossfades cleanly. No video is generated
+   or encoded — the camera move is computed at runtime from depth.
 3. **Wires it up** — a config-driven scroll engine that plays the whole chain as one
    flight, serving the portrait clips and posters automatically on phones.
 
@@ -88,21 +91,21 @@ When invoked, the skill:
 skills/scroll-world/
 ├── SKILL.md                    the procedure + the seam rule + gotchas
 └── references/
-    ├── prompts.md              intake checklist + every Higgsfield prompt template
-    ├── pipeline.md             copy-paste batch scripts (generate → frames → connectors → encode)
-    ├── scrub-engine.js         portable, config-driven scrub engine (blob-seek, lazy load, seam crossfade)
+    ├── prompts.md              intake checklist + the scene-still prompt template
+    ├── pipeline.md             copy-paste batch scripts (generate stills → estimate depth per still → optional knockout)
+    ├── scrub-engine.js         portable, config-driven WebGL parallax engine (loads still+depth, depth-displaces a quad by scroll, seam crossfade)
     ├── index-template.html     a minimal standalone page that mounts the engine
-    └── knockout.py             background knockout for floating scenes
+    ├── depth-map.py            relative-depth estimation (Depth-Anything) → normalized depth map
+    └── knockout.py             background knockout for floating scenes (unchanged)
 ```
 
 ## Notes
 
-- Asset generation costs Higgsfield credits (~N image gens + ~2N-1 video gens for N
-  scenes; the mobile chain doubles the video gens) and takes a while — the skill runs
-  generations in the background and polls. Per-generation pricing isn't exposed by the
-  CLI, so the skill calibrates against your live balance and states the estimated total
-  before spending.
-- The generated `.mp4`/`.webp` assets are produced per project; they're not shipped here.
+- There are **no credits and no video**. The only compute is local depth estimation
+  (Depth-Anything, once per still) plus the live shader in the browser — the skill costs
+  nothing to run beyond a little CPU for depth maps.
+- The generated `still`/`depth` asset pairs are produced per project; they're not shipped
+  here.
 
 ## Star History
 

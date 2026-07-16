@@ -25,29 +25,32 @@
       brand: { name: 'BRAND', href: '#top' },
       cta: { label: 'Order now', href: '#finale' },
       hint: 'scroll to fly in',
-      diveScroll: 1.3,
-      connScroll: 0.9,
+      scrollPer: 1.3,            // viewport-heights of scroll per scene
+      depth: 0.06,               // parallax strength
+      zoom: 0.18,                // how far the camera pushes in across a scene
       sections: [
         // One object per scene, in order. `accent` colours the copy/route for that scene.
         // First section is the hero (its copy greets on landing); last carries the CTA.
+        // Each scene is an IMAGE + DEPTH-MAP pair (no video):
+        //   still : the generated scene still (webp/png)
+        //   depth : a grayscale depth map, white=near / black=far (see depth-map.py)
         {
           id: 'sceneA', label: 'Scene A',
           still: 'assets/sceneA.webp',
-          clip: 'assets/vid/sceneA.mp4',
-          clipMobile: 'assets/vid/sceneA-m.mp4',   // mobile opt-in only: lighter 720p encode served on phones
-          accent: '#8FB98A',
+          depth: 'assets/depth_sceneA.png',
+          focal: [0.5, 0.42],     // optional: where the camera dives toward (UV, y from top)
           // scroll: 1.6, linger: 0.45,  // optional pacing: longer dwell; camera settles mid-scene
+          accent: '#8FB98A',
           eyebrow: 'Value prop label',
           title: 'The hero line.',
           body: 'One plain-spoken sentence about this stage.',
           tags: ['Proof', 'Proof', 'Proof'],
         },
-        // …middle scenes…
+        // …middle scenes (each with its own still + depth pair)…
         {
           id: 'finale', label: 'The Product',
           still: 'assets/product.webp',
-          clip: 'assets/vid/finale.mp4',
-          clipMobile: 'assets/vid/finale-m.mp4',
+          depth: 'assets/depth_product.png',
           accent: '#9B7EBD',
           eyebrow: 'And it all pours into',
           title: 'One perfect thing.',
@@ -57,16 +60,8 @@
                  secondary: { label: 'See more', href: '#' } },
         },
       ],
-      // length === sections.length - 1, in order. Generated per SKILL.md Step 5.
-      connectors: [
-        'assets/vid/conn1.mp4',
-        // 'assets/vid/conn2.mp4', …
-      ],
-      // Mobile opt-in only: lighter connectors for phones — same length/order as `connectors`.
-      connectorsMobile: [
-        'assets/vid/conn1-m.mp4',
-        // 'assets/vid/conn2-m.mp4', …
-      ],
+      // No `clip` / `connectors` / mobile variants — the depth shader drives every
+      // viewport from the same still+depth pair. See SKILL.md Step 5.
     });
   </script>
 </body>

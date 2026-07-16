@@ -3,211 +3,116 @@
 Set these once. `NAMES` is the ordered section ids; the last is the hero/finale.
 
 ```bash
-WORK=/tmp/scroll-world           # scratch dir for prompts, sources, frames
-ASSETS=./assets                  # where the site reads stills (webp) + clips (mp4)
-mkdir -p "$WORK" "$ASSETS/vid"
+WORK=/tmp/scroll-world           # scratch dir for prompts, stills, depth maps
+ASSETS=./assets                  # where the site reads stills (webp) + depth maps (png)
+mkdir -p "$WORK" "$ASSETS"
 NAMES="farm kitchen shop delivery plaza finale"   # <-- your section ids, in order
-
-# Chain video model — ONE for every chained clip (SKILL Step 4 roster).
-# Must accept --start-image AND --end-image (verify: higgsfield model get <model>):
-# seedance_2_0 | kling3_0 | seedance_2_0_mini (draft tier). Reference-only models can't
-# hold a seam; models without --mode (e.g. kling3_0_turbo) need their own flag branch below.
-VMODEL=seedance_2_0
-case "$VMODEL" in                                  # per-model flags + durations (bash 3.2 safe)
-  kling3_0)          VOPTS="--mode std --sound off";          DIVE_DUR=10; CONN_DUR=5 ;;  # no --resolution param on Kling
-  seedance_2_0_mini) VOPTS="--mode std --resolution 720p";    DIVE_DUR=8;  CONN_DUR=5 ;;  # cheap frame-locked previz
-  *)                 VOPTS="--mode std --resolution 1080p";   DIVE_DUR=8;  CONN_DUR=5 ;;  # seedance_2_0 default
-esac
 ```
 
-Higgsfield generations take minutes — every `higgsfield ... --wait` call below is meant
-to run inside a **backgrounded** script. Launch the whole script with your tool's
-background/detached mode and poll the progress log; never block the foreground.
+There are **no videos** in this skill anymore — no Higgsfield calls, no ffmpeg encode, no
+connectors. The whole run is: generate N stills → estimate a depth map for each → (optional)
+knock out backgrounds → point the engine at `still` + `depth` pairs. Every step is
+local/bash-3.2-safe.
 
 ## 1. Scene stills (Step 2)
 
-Write one prompt file per section to `$WORK/still_<name>.txt` (see prompts.md), then:
+Write one prompt file per section to `$WORK/still_<name>.txt` (see prompts.md), then
+generate. **Codex `image_gen`** (preferred, subscription-billed, zero credits) when the CLI
+is present:
 
 ```bash
 gen_still() { # name
-  higgsfield generate create gpt_image_2 --prompt "$(cat "$WORK/still_$1.txt")" \
-    --aspect_ratio 3:2 --resolution 2k --quality high --wait --wait-timeout 15m --json \
-    > "$WORK/still_$1.json" 2> "$WORK/still_$1.err"
-  url=$(jq -r '.[0].result_url // empty' "$WORK/still_$1.json")
-  [ -n "$url" ] && curl -fsSL "$url" -o "$WORK/still_$1.png" && echo "still $1 ok" || echo "still $1 FAIL"
+  codex exec -C "$WORK" -s workspace-write --skip-git-repo-check \
+    'Use the image generation tool ($imagegen) to generate: '"$(cat "$WORK/still_$1.txt")"' Wide 3:2 landscape, high resolution. Save it as ./still_'"$1"'.png. Do not do anything else.' \
+    > "$WORK/still_$1.codex.log" 2>&1
+  [ -f "$WORK/still_$1.png" ] && echo "still $1 ok" || echo "still $1 FAIL (see .codex.log)"
 }
 for n in $NAMES; do gen_still "$n" & done ; wait
 ```
 
-Codex variant (STILLS_SOURCE=codex, SKILL Step 1.6 — subscription-billed, zero
-credits; ~1–3 min each, parallelize in small batches):
-
-```bash
-gen_still_codex() { # name
-  codex exec -C "$WORK" -s workspace-write --skip-git-repo-check \
-    'Use the image generation tool ($imagegen) to generate: '"$(cat "$WORK/still_$1.txt")"' Wide 3:2 landscape, high resolution. Save it as ./still_'"$1"'.png. Do not do anything else.' \
-    > "$WORK/still_$1.codex.log" 2>&1
-  [ -f "$WORK/still_$1.png" ] && echo "still $1 ok (codex)" || echo "still $1 FAIL (see .codex.log)"
-}
-```
-
-Convert to webp for the site (and optionally run knockout.py first for transparency):
+**No Codex CLI?** Have the user drop stills at `$WORK/still_<name>.png` (any generator) and
+skip the loop. Either way, convert to webp for the site (and optionally run `knockout.py`
+first for transparency):
 
 ```bash
 for n in $NAMES; do cwebp -quiet -q 84 -resize 1800 0 "$WORK/still_$n.png" -o "$ASSETS/$n.webp"; done
 ```
 
-Review the stills for cohesion before continuing. Re-roll any off-style one (optionally
-add `--image "$WORK/still_<good>.png"` to lock style).
+Review the stills for cohesion **and** for clear near/far structure before continuing
+(re-roll any off-style or depth-ambiguous one).
 
-## 2. Dive-in clips (Step 4)
+## 2. Depth maps — the per-still pass (Step 4)
 
-Prompt files at `$WORK/dive_<name>.txt`. Start image = the solid-bg still PNG.
-
-```bash
-gen_dive() { # name                       ($VOPTS is unquoted on purpose — word-split flags)
-  higgsfield generate create "$VMODEL" --prompt "$(cat "$WORK/dive_$1.txt")" \
-    --start-image "$WORK/still_$1.png" \
-    $VOPTS --aspect_ratio 16:9 --duration "$DIVE_DUR" \
-    --wait --wait-timeout 20m --json > "$WORK/dive_$1.json" 2> "$WORK/dive_$1.err"
-  url=$(jq -r '.[0].result_url // empty' "$WORK/dive_$1.json")
-  [ -n "$url" ] && curl -fsSL "$url" -o "$WORK/dive_$1.mp4" && echo "dive $1 ok" || echo "dive $1 FAIL"
-}
-for n in $NAMES; do gen_dive "$n" & done ; wait
-```
-
-Re-roll individual failures (503 / credit race are transient):
-`gen_dive shop`  (just that one).
-
-## 3. Extract boundary frames — the seam handoff (Step 5)
-
-For each adjacent pair, the connector's start = dive_i's LAST frame, end = dive_{i+1}'s
-FIRST frame — extracted from the **rendered videos**, never the stills.
+This is the step that used to be "generate connector clips." For every still, estimate a
+relative depth map and save it as a normalized grayscale PNG (white = near, black = far),
+one checkpoint + one normalization for all N (so the parallax direction never flips at a
+seam). `references/depth-map.py` wraps Depth-Anything:
 
 ```bash
-set -- $NAMES
-prev=""
-for n in "$@"; do
-  ffmpeg -v error -ss 0 -i "$WORK/dive_$n.mp4" -frames:v 1 -q:v 2 "$WORK/first_$n.png"      # establishing
-  ffmpeg -v error -sseof -0.15 -i "$WORK/dive_$n.mp4" -frames:v 1 -q:v 2 "$WORK/last_$n.png" # interior
+# one checkpoint for every scene — do NOT mix models across the run
+for n in $NAMES; do
+  python3 depth-map.py "$WORK/still_$n.png" "$ASSETS/depth_$n.png" \
+    --model depth-anything-large-hf --down 2
 done
 ```
 
-## 4. Connector clips (Step 5)
+- `--down 2` halves the map resolution (depth is low-frequency; smaller maps scrub cheaper
+  and look identical). Drop it for full-res if you want crisper edges.
+- Output is forced to grayscale and normalized to the 0–255 range with **near = white**. If
+  you ever swap the convention, you must swap it for *all* scenes or you'll get seam pops.
+- Smoke test on one still first (`python3 depth-map.py still_farm.png /tmp/d.png`) to
+  confirm the model downloads and the map looks sane before batching.
 
-Prompt files at `$WORK/conn_<i>.txt` (i = 1..N-1). Iterate adjacent pairs:
+If you'd rather not depend on `transformers`/`torch`, any depth endpoint works as long as
+it emits a normalized grayscale map with the same near/far convention — just save it to
+`$ASSETS/depth_<name>.png` and skip the loop above.
 
-```bash
-gen_conn() { # i startPng endPng          (end-image required → seedance/kling3_0 only)
-  higgsfield generate create "$VMODEL" --prompt "$(cat "$WORK/conn_$1.txt")" \
-    --start-image "$2" --end-image "$3" \
-    $VOPTS --aspect_ratio 16:9 --duration "$CONN_DUR" \
-    --wait --wait-timeout 20m --json > "$WORK/conn_$1.json" 2> "$WORK/conn_$1.err"
-  url=$(jq -r '.[0].result_url // empty' "$WORK/conn_$1.json")
-  [ -n "$url" ] && curl -fsSL "$url" -o "$WORK/conn_$1.mp4" && echo "conn $1 ok" || echo "conn $1 FAIL"
-}
-set -- $NAMES ; i=0 ; prev=""
-for n in "$@"; do
-  if [ -n "$prev" ]; then i=$((i+1)); gen_conn "$i" "$WORK/last_$prev.png" "$WORK/first_$n.png" & fi
-  prev="$n"
-done ; wait
-```
+## 3. (Optional) Float the scenes — knockout (Step 3)
 
-## 5. Encode everything for scrubbing (Step 6)
-
-Native resolution (1080p from seedance std; kling3_0 std returned **720p** in testing —
-never upscale, encode what ffprobe reports), crf 20, GOP 8, light sharpen, no audio,
-faststart. Same for dives + connectors.
+If you want the dioramas to float over the atmosphere, knock out the flat background to
+transparency (border-connected flood fill — preserves interior colour that matches the bg).
+The engine composites the still's alpha over the sky, so transparent areas show through.
 
 ```bash
-enc() { ffmpeg -v error -y -i "$1" -an -vf "unsharp=5:5:0.8:5:5:0.0" \
-  -c:v libx264 -preset slow -crf 20 -pix_fmt yuv420p \
-  -g 8 -keyint_min 8 -sc_threshold 0 -movflags +faststart "$2"; echo "enc $2 $(du -h "$2"|cut -f1)"; }
-
-for n in $NAMES; do enc "$WORK/dive_$n.mp4" "$ASSETS/vid/$n.mp4"; done
-i=0; for f in "$WORK"/conn_*.mp4; do i=$((i+1)); enc "$f" "$ASSETS/vid/conn$i.mp4"; done
+python3 knockout.py "$WORK"/still_*.png      # writes still_*.rgba.png
+# re-encode the knocked-out stills to webp *with* alpha:
+for n in $NAMES; do cwebp -quiet -q 84 -alpha_q 95 -resize 1800 0 "$WORK/still_$n.rgba.png" -o "$ASSETS/$n.webp"; done
 ```
 
-Now the engine config's `sections[k].clip = assets/vid/<name>.mp4` and
-`connectors = [assets/vid/conn1.mp4, …]` (length N-1, in order).
+Keep the depth maps opaque (they have no alpha — depth is a single channel); only the still
+gets transparency.
 
-## 6. Centre-crop mobile encodes — FALLBACK ONLY, not the mobile version
+## 4. Wire it up (Step 5)
 
-**The mobile version is the native 9:16 portrait chain (§6b).** This section's crop
-encodes exist for one case: the user opted into mobile but credits can't cover the
-portrait chain — and shipping them must be called out and approved, never silent
-(portrait phones will see the landscape film's centre ~26%). The encode mechanics
-matter either way: scrubbing sets `currentTime` every frame, and a phone decoder's
-**seek cost scales with how many frames it must decode from the nearest keyframe** — so
-a 1080p `-g 8` master that scrubs fine on a laptop stutters on a phone. A **smaller
-frame + tighter GOP** fixes that (and halves the bytes on cellular). The crop `-m.mp4`
-sibling per clip:
-
-```bash
-# 720p, GOP 4 (twice the keyframes = ~half the seek-decode work), crf 23, same sharpen/faststart.
-encm() { ffmpeg -v error -y -i "$1" -an -vf "scale=-2:720,unsharp=5:5:0.6:5:5:0.0" \
-  -c:v libx264 -preset slow -crf 23 -pix_fmt yuv420p \
-  -g 4 -keyint_min 4 -sc_threshold 0 -movflags +faststart "$2"; echo "encm $2 $(du -h "$2"|cut -f1)"; }
-
-for n in $NAMES; do encm "$WORK/dive_$n.mp4" "$ASSETS/vid/$n-m.mp4"; done
-i=0; for f in "$WORK"/conn_*.mp4; do i=$((i+1)); encm "$f" "$ASSETS/vid/conn$i-m.mp4"; done
-```
-
-Wire the variants in the engine config — the engine serves them automatically on phones,
-falling back to the desktop `clip` when a mobile one is absent:
+Now the engine config's `sections[k]` takes a **`still` + `depth` pair** — no `clip`,
+`connectors`, or mobile variants:
 
 ```js
-sections[k].clipMobile = 'assets/vid/<name>-m.mp4';
-connectorsMobile = ['assets/vid/conn1-m.mp4', …];   // length N-1, in order
+sections: [
+  { id:'farm', label:'The Farms', still:'assets/farm.webp',  depth:'assets/depth_farm.png',  accent:'#8FB98A', … },
+  { id:'kitchen', label:'The Kitchen', still:'assets/kitchen.webp', depth:'assets/depth_kitchen.png', … },
+  // …one per section; last may carry a `cta`
+]
 ```
 
-If phone scrubbing still stutters, tighten the GOP further (`-g 2`, or `-g 1` for all-intra
-= instant seeks at the cost of larger files); if cellular weight is the bigger worry, raise
-`crf` (24–26) or drop to `scale=-2:600`. If the master is already 720p (e.g. kling3_0 std),
-the mobile encode still pays off — the tighter GOP is what makes phone seeks cheap. All-mobile encodes stay 16:9 — the engine
-centre-crops them; see the portrait note in SKILL Step 8 / prompts.md.
-
-## 6b. Native 9:16 portrait chain — THE mobile version (Step 1.5 opt-in)
-
-When the user opts into mobile, this is what they get: a **parallel 9:16 chain** rendered
-natively for phones and shipped as the mobile variants — never the §6 crops (those are the
-no-credits stopgap). Same seam laws as the main chain — the portrait chain frame-locks
-against its own rendered frames, never the landscape ones. Budget ~2N-1 video gens +
-re-rolls (interiors trip the NSFW filter in portrait too); state the credit cost at the
-Step 1.5 interview.
-
-1. **Portrait start canvases.** Don't hand the video model a 3:2 still and hope: composite
-   each scene onto a 1080×1920 canvas in the page bg colour (island at ~94% width, visual
-   centre at ~45% height). The render then opens exactly on what the portrait poster shows.
-   For knocked-out stills, composite the RGBA over the bg colour first.
-2. **Dives/legs**: same prompt templates with a portrait clause up front ("Vertical
-   portrait composition, the diorama centered with generous [bg] space above and below"),
-   `--aspect_ratio 9:16`, same model/params as the main chain. Review each last frame
-   before chaining, as ever.
-3. **Connectors**: extract first/last frames **from the 9:16 renders** and generate 9:16
-   connectors between them. A native 9:16 scene mixed into cropped-16:9 neighbours pops at
-   both seams — the portrait chain must be complete, not partial.
-4. **Encode** with the §6 settings but portrait-oriented scale: `scale=720:-2` (720 wide),
-   `-g 4`, crf 23 → these ARE the `-m.mp4` mobile files (and they replace any §6 crop
-   stopgaps that shipped earlier).
-5. **Posters**: extract each 9:16 dive's first frame → webp → wire as the section's
-   `stillMobile` so the poster matches the portrait video's frame 0 (no landscape→portrait
-   flash when the clip paints). Engine support: `sections[k].stillMobile`.
+The engine loads each `still`/`depth` as a WebGL texture (lazy, near the active scroll),
+depth-displaces a full-screen quad by scroll progress, and crossfades between consecutive
+scenes across a fixed seam band. See `scrub-engine.js` for the full config + CSS vars and
+`index-template.html` for a minimal standalone page.
 
 ## Notes
 
-- `.[0].result_url` is the field on the `--wait --json` job object. `.min_result_url` is
-  a lower-res preview if you ever want it.
-- **NSFW fallback across models**: if one clip keeps getting flagged on seedance after
-  re-rolls + prompt scrubbing, regenerate just that clip on `kling3_0` with the SAME
-  start/end frames: `VMODEL=kling3_0; VOPTS="--mode std --sound off"; gen_conn 3 …` —
-  then restore your chain model. See SKILL Gotchas for the trade-off.
-- **Previz on the cheap**: run the whole chain once with `VMODEL=seedance_2_0_mini`
-  (frame-locking intact, ~720p) to validate the journey and seams before spending
-  full-model credits — because it's still seamless, the previz translates directly to the
-  final render. Don't reach for reference-only models here: without `--start/--end-image`
-  they can't hold a seam, so their output can't be chained (Step 4 rule).
-- If a whole batch stalls, check `higgsfield workspace list` for credits and
-  `$WORK/*.err` for the reason.
-- Concurrency: launching ~5–6 gens at once is fine; much more can trigger transient
-  credit/race errors — stagger or re-roll.
+- **No credits, no encode.** There are no Higgsfield calls and no ffmpeg step — the camera
+  move is computed live in the shader from the depth maps, so this whole run costs nothing
+  but a little local CPU for depth estimation.
+- **One depth convention, one checkpoint.** Mixed near/far conventions (or mixing
+  `depth-anything-small` with `-large`) flip the parallax direction and produce seam pops;
+  keep the `depth-map.py` invocation identical for all N.
+- **Depth is the seam.** The crossfade at a seam is continuous only if scene *i+1*'s depth
+  pose matches across the boundary — which it does by construction (same convention, same
+  `focal`). If a seam reads as a hard cut, widen the engine's `crossfade` (default ~0.14
+  vh) before re-estimating depth.
+- Concurrency: launching ~5–6 Codex gens at once is fine; much more can trip rate limits —
+  stagger or re-run the individual failure. Depth estimation is a one-off per still and
+  cheap enough to run inline.
+- If a whole batch stalls, check `$WORK/*.codex.log` for the reason.
