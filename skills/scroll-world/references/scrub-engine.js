@@ -215,9 +215,13 @@ function mountScrollWorld(container, config) {
   function resizeCanvas() {
     if (!gl) return;
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    const w = Math.max(1, Math.floor(container.clientWidth * dpr));
-    const h = Math.max(1, Math.floor(container.clientHeight * dpr));
-    if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+    // The canvas is 100% of the fixed viewport-height stage, so size the drawing
+    // buffer from its own CSS box (fall back to the window if not yet laid out).
+    const w = canvas.clientWidth || window.innerWidth;
+    const h = canvas.clientHeight || window.innerHeight;
+    const W = Math.max(1, Math.floor(w * dpr));
+    const H = Math.max(1, Math.floor(h * dpr));
+    if (canvas.width !== W || canvas.height !== H) { canvas.width = W; canvas.height = H; }
   }
 
   function makeTexture(url) {
