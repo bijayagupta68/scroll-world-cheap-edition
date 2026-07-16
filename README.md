@@ -1,7 +1,7 @@
 # scroll-world
 
 
-https://github.com/user-attachments/assets/b08e641e-985b-4bd4-83ff-6750272d0c37
+
 
 
 An agent skill — for Claude Code, Codex, and any `SKILL.md`-compatible agent — that
